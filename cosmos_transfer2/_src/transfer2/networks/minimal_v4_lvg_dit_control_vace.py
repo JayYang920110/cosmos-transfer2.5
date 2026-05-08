@@ -26,7 +26,7 @@ from torch.distributed import ProcessGroup, get_process_group_ranks
 from torchvision import transforms
 
 from cosmos_transfer2._src.imaginaire.utils.graph import create_cuda_graph
-from cosmos_transfer2._src.predict2.conditioner import DataType
+from cosmos_transfer2._src.predict2.conditioner import CrossAttnLogitBoostParams, DataType
 from cosmos_transfer2._src.predict2.networks.minimal_v4_dit import (
     Attention,
     FinalLayer,
@@ -90,8 +90,13 @@ class I2VCrossAttentionFull(Attention):
 
         return q, k, v, q_img, k_img, v_img
 
-    def compute_attention(self, q, k, v, q_img, k_img, v_img):
-        result = self.attn_op(q, k, v)  # [B, S, H, D] - text attention using shared q
+    def compute_attention(self, q, k, v, q_img, k_img, v_img, attn_logit_bias=None):
+        if attn_logit_bias is not None:
+            # TransformerEngine's DotProductAttention doesn't support bias; use PyTorch SDPA instead
+            from cosmos_transfer2._src.predict2.networks.minimal_v4_dit import torch_attention_op
+            result = torch_attention_op(q, k, v, attn_mask=attn_logit_bias)
+        else:
+            result = self.attn_op(q, k, v)  # [B, S, H, D] - text attention using shared q
         result_img = self.attn_op(q_img, k_img, v_img)  # [B, S, H, D] - image attention using separate q_img
         return self.output_dropout(self.output_proj(result + result_img))
 
@@ -100,9 +105,10 @@ class I2VCrossAttentionFull(Attention):
         x,
         context=None,
         rope_emb=None,
+        attn_logit_bias=None,
     ):
         q, k, v, q_img, k_img, v_img = self.compute_qkv(x, context, rope_emb)
-        return self.compute_attention(q, k, v, q_img, k_img, v_img)
+        return self.compute_attention(q, k, v, q_img, k_img, v_img, attn_logit_bias=attn_logit_bias)
 
 
 # Modified BaseBlock class with share_q_in_i2v_cross_attn parameter
@@ -169,6 +175,7 @@ class Block(BaseBlock):
                 x_dim // num_heads,
                 img_latent_dim=image_context_dim,
                 qkv_format="bshd",
+                backend=backend,
             )
 
 
@@ -916,9 +923,12 @@ class MinimalV4LVGControlVaceDiT(MiniTrainDITImageContext):
         data_type: Optional[DataType] = DataType.VIDEO,
         img_context_emb: Optional[torch.Tensor] = None,
         control_context_scale: float | torch.Tensor = 1.0,
+        crossattn_logit_boost: Optional[CrossAttnLogitBoostParams] = None,
+        solver_step_index: Optional[int] = None,
+        crossattn_logit_boost_spatial_weight: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor | List[torch.Tensor] | Tuple[torch.Tensor, List[torch.Tensor]]:
-        del kwargs
+        del kwargs  # Ignore unknown kwargs for forward compatibility
         assert not (self.training and self.use_cuda_graphs), "CUDA Graphs are supported only for inference"
         # control branch forward
         # Get the original shape
@@ -1093,6 +1103,10 @@ class MinimalV4LVGControlVaceDiT(MiniTrainDITImageContext):
                 "rope_emb_L_1_1_D": rope_emb_L_1_1_D_for_control,
                 "adaln_lora_B_T_3D": adaln_lora_B_T_3D_for_control,
                 "extra_per_block_pos_emb": extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D_for_control,
+                "timesteps_B_T": timesteps_B_T,
+                "crossattn_logit_boost": crossattn_logit_boost,
+                "solver_step_index": solver_step_index,
+                "crossattn_logit_boost_spatial_weight": crossattn_logit_boost_spatial_weight,
             }
             if self.use_cuda_graphs:
                 shapes_key = create_cuda_graph(
@@ -1128,6 +1142,10 @@ class MinimalV4LVGControlVaceDiT(MiniTrainDITImageContext):
             "adaln_lora_B_T_3D": adaln_lora_B_T_3D,
             "extra_per_block_pos_emb": extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D,
             "control_context_scale": control_context_scale,
+            "timesteps_B_T": timesteps_B_T,
+            "crossattn_logit_boost": crossattn_logit_boost,
+            "solver_step_index": solver_step_index,
+            "crossattn_logit_boost_spatial_weight": crossattn_logit_boost_spatial_weight,
         }
         if self.use_cuda_graphs:
             hints = torch.stack(hints)

@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"import anthropic\")",
+      "Bash(/workspace/.venv/bin/python -c \"import anthropic; print\\(anthropic.__version__\\)\")",
+      "Bash(/workspace/.venv/bin/pip install *)",
+      "Bash(pip3 install *)",
+      "Bash(python3 -c \"import anthropic; print\\(anthropic.__version__\\)\")"
+    ]
+  }
+}

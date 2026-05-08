@@ -205,3 +205,8 @@ cython_debug/
 !assets/**/*.png
 !assets/**/*.jpg
 !assets/**/*.mp4
+
+test/
+*:Zone.Identifier
+OurBench/
+*.tar.gz

@@ -104,11 +104,31 @@ class BaseCondition(ABC):
 
 
 @dataclass(frozen=True)
+class CrossAttnLogitBoostParams:
+    """Static cross-attention logit boost settings (segment + strength + optional inference step cap).
+
+    For multi-instance FOCUS-style rectification, ``segments`` carries one (start, end) span per
+    instance group. ``segment_start``/``segment_end`` are the single-instance shorthand and may
+    be None when ``segments`` is provided.
+    """
+
+    creg: float
+    p: float
+    segment_start: Optional[int] = None
+    segment_end: Optional[int] = None
+    segments: Optional[List[Tuple[int, int]]] = None
+    region_end_step: Optional[int] = None
+
+
+@dataclass(frozen=True)
 class Text2WorldCondition(BaseCondition):
     crossattn_emb: Optional[torch.Tensor] = None
     data_type: DataType = DataType.VIDEO
     padding_mask: Optional[torch.Tensor] = None
     fps: Optional[torch.Tensor] = None
+    crossattn_logit_boost: Optional[CrossAttnLogitBoostParams] = None
+    crossattn_logit_boost_spatial_weight: Optional[torch.Tensor] = None
+    """Optional (B, N, T, H, W) per-instance weights aligned with the pixel-space batch video; scaled to DiT latent (T,H,W) inside the network. N must equal the number of segments in ``crossattn_logit_boost``."""
 
     def edit_data_type(self, data_type: DataType) -> Text2WorldCondition:
         """Edit the data type of the condition.
@@ -525,7 +545,15 @@ class GeneralConditioner(nn.Module, ABC):
             dropout_rates[emb_name] = 1.0 if embedder.dropout_rate > 1e-4 else 0.0
 
         condition: Any = self(data_batch, override_dropout_rate=cond_dropout_rates)
-        un_condition: Any = self(data_batch, override_dropout_rate=dropout_rates)
+        # Strip cross-attention logit boost from the unconditional pass: its segment
+        # indices and spatial mask are computed against the positive prompt and do
+        # not align with the unconditional/null prompt tokens.
+        data_batch_uncond = {
+            k: v
+            for k, v in data_batch.items()
+            if k not in ("crossattn_logit_boost", "crossattn_logit_boost_spatial_weight")
+        }
+        un_condition: Any = self(data_batch_uncond, override_dropout_rate=dropout_rates)
         return condition, un_condition
 
     def get_condition_with_negative_prompt(
@@ -548,6 +576,11 @@ class GeneralConditioner(nn.Module, ABC):
         if "neg_t5_text_embeddings" in data_batch_neg_prompt:
             if isinstance(data_batch_neg_prompt["neg_t5_text_embeddings"], torch.Tensor):
                 data_batch_neg_prompt["t5_text_embeddings"] = data_batch_neg_prompt["neg_t5_text_embeddings"]
+        # Strip cross-attention logit boost from the negative-prompt pass: its segment
+        # indices and spatial mask are computed against the positive prompt and do
+        # not align with the negative prompt's tokens.
+        data_batch_neg_prompt.pop("crossattn_logit_boost", None)
+        data_batch_neg_prompt.pop("crossattn_logit_boost_spatial_weight", None)
 
         condition: Any = self(data_batch, override_dropout_rate=cond_dropout_rates)
         un_condition: Any = self(data_batch_neg_prompt, override_dropout_rate=uncond_dropout_rates)
@@ -562,6 +595,14 @@ class VideoConditioner(GeneralConditioner):
         override_dropout_rate: Optional[Dict[str, float]] = None,
     ) -> Text2WorldCondition:
         output = super()._forward(batch, override_dropout_rate)
+        boost = batch.get("crossattn_logit_boost")
+        if boost is not None:
+            if isinstance(boost, dict):
+                boost = CrossAttnLogitBoostParams(**boost)
+            output["crossattn_logit_boost"] = boost
+        sw = batch.get("crossattn_logit_boost_spatial_weight")
+        if sw is not None:
+            output["crossattn_logit_boost_spatial_weight"] = sw
         return Text2WorldCondition(**output)
 
 
@@ -572,4 +613,12 @@ class GR00TV1Img2VidConditioner(GeneralConditioner):
         override_dropout_rate: Optional[Dict[str, float]] = None,
     ) -> GR00TV1Img2VidCondition:
         output = super()._forward(batch, override_dropout_rate)
+        boost = batch.get("crossattn_logit_boost")
+        if boost is not None:
+            if isinstance(boost, dict):
+                boost = CrossAttnLogitBoostParams(**boost)
+            output["crossattn_logit_boost"] = boost
+        sw = batch.get("crossattn_logit_boost_spatial_weight")
+        if sw is not None:
+            output["crossattn_logit_boost_spatial_weight"] = sw
         return GR00TV1Img2VidCondition(**output)

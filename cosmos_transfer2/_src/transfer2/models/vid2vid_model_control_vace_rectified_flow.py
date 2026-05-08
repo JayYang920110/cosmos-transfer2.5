@@ -14,7 +14,7 @@
 # limitations under the License.
 
 import os
-from typing import Callable, Dict, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
 import attrs
 import torch
@@ -213,7 +213,7 @@ class ControlVideo2WorldModelRectifiedFlow(Video2WorldModelRectifiedFlow):
             latent_control_input.append(zero_latent_state)
         return latent_control_input
 
-    def denoise(self, noise: torch.Tensor, xt_B_C_T_H_W: torch.Tensor, timesteps_B_T: torch.Tensor, condition):
+    def denoise(self, noise: torch.Tensor, xt_B_C_T_H_W: torch.Tensor, timesteps_B_T: torch.Tensor, condition, solver_step_index: Optional[int] = None):
         """
         Override denoise method for control branch support in rectified flow.
         """
@@ -223,7 +223,7 @@ class ControlVideo2WorldModelRectifiedFlow(Video2WorldModelRectifiedFlow):
             pass
 
         # Call parent's denoise method
-        return super().denoise(noise, xt_B_C_T_H_W, timesteps_B_T, condition)
+        return super().denoise(noise, xt_B_C_T_H_W, timesteps_B_T, condition, solver_step_index=solver_step_index)
 
     def get_velocity_fn_from_batch(
         self,
@@ -289,7 +289,7 @@ class ControlVideo2WorldModelRectifiedFlow(Video2WorldModelRectifiedFlow):
         world_size = get_world_size()
         rank = get_rank()
 
-        def velocity_fn(noise: torch.Tensor, noise_x: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
+        def velocity_fn(noise: torch.Tensor, noise_x: torch.Tensor, timestep: torch.Tensor, solver_step_index: Optional[int] = None) -> torch.Tensor:
             noise_x = noise_x.to(**self.tensor_kwargs)
             """
             Use CFG parallel with 2 independent CP groups, each performing one denoising step.
@@ -301,9 +301,9 @@ class ControlVideo2WorldModelRectifiedFlow(Video2WorldModelRectifiedFlow):
                 second_cp_start_rank = world_size // 2
 
                 if rank < second_cp_start_rank:
-                    cond_v = self.denoise(noise, noise_x, timestep, condition)
+                    cond_v = self.denoise(noise, noise_x, timestep, condition, solver_step_index=solver_step_index)
                 else:
-                    uncond_v = self.denoise(noise, noise_x, timestep, uncondition)
+                    uncond_v = self.denoise(noise, noise_x, timestep, uncondition, solver_step_index=solver_step_index)
 
                 rec_tensor = torch.empty_like(cond_v if rank < second_cp_start_rank else uncond_v)
                 if rank < second_cp_start_rank:
@@ -319,8 +319,8 @@ class ControlVideo2WorldModelRectifiedFlow(Video2WorldModelRectifiedFlow):
                     cond_v = rec_tensor
             else:
                 # Standard path without CFG parallelism
-                cond_v = self.denoise(noise, noise_x, timestep, condition)
-                uncond_v = self.denoise(noise, noise_x, timestep, uncondition)
+                cond_v = self.denoise(noise, noise_x, timestep, condition, solver_step_index=solver_step_index)
+                uncond_v = self.denoise(noise, noise_x, timestep, uncondition, solver_step_index=solver_step_index)
             velocity_pred = cond_v + guidance * (cond_v - uncond_v)
             return velocity_pred
 
@@ -439,7 +439,7 @@ class ControlVideo2WorldModelRectifiedFlow(Video2WorldModelRectifiedFlow):
                 if get_rank() == 0:
                     log.debug(f"denoising with guided generation at step {num_step}")
 
-            velocity_pred = velocity_fn(noise, latent_model_input, timestep.unsqueeze(0))
+            velocity_pred = velocity_fn(noise, latent_model_input, timestep.unsqueeze(0), solver_step_index=num_step)
             temp_x0 = self.sample_scheduler.step(
                 velocity_pred.unsqueeze(0), t, latents[0].unsqueeze(0), return_dict=False, generator=seed_g
             )[0]

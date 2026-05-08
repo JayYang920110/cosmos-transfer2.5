@@ -286,6 +286,17 @@ class Control2WorldInference:
                 guided_generation_mask=guided_generation_mask,
                 guided_generation_step_threshold=guided_generation_step_threshold,
                 guided_generation_foreground_labels=guided_generation_foreground_labels,
+                crossattn_logit_boost=sample.crossattn_logit_boost,
+                crossattn_spatial_mask_path=path_to_str(sample.crossattn_spatial_mask_path),
+                crossattn_spatial_mask_invert=sample.crossattn_spatial_mask_invert,
+                crossattn_boost_instance_masks=(
+                    [
+                        (path_to_str(inst.mask_path), inst.mask_invert)
+                        for inst in sample.crossattn_boost_instances
+                    ]
+                    if sample.crossattn_boost_instances is not None
+                    else None
+                ),
             )
             if self.setup_args.benchmark:
                 torch.cuda.synchronize()

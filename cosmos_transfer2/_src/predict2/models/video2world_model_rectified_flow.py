@@ -79,6 +79,7 @@ class Video2WorldModelRectifiedFlow(Text2WorldModelRectifiedFlow):
         xt_B_C_T_H_W: torch.Tensor,
         timesteps_B_T: torch.Tensor,
         condition: Text2WorldCondition,
+        solver_step_index: Optional[int] = None,
     ) -> DenoisePrediction:
         """
         Args:
@@ -121,10 +122,18 @@ class Video2WorldModelRectifiedFlow(Text2WorldModelRectifiedFlow):
                 )  # add dimension for batch
 
         # forward pass through the network
+        net_kwargs = condition.to_dict()
+        # Pop explicit kwargs if present to avoid duplicate args if they also exist in condition
+        net_kwargs.pop("crossattn_logit_boost", None)
+        net_kwargs.pop("crossattn_logit_boost_spatial_weight", None)
+
         net_output_B_C_T_H_W = self.net(
             x_B_C_T_H_W=xt_B_C_T_H_W.to(**self.tensor_kwargs),  # Eq. 7 of https://arxiv.org/pdf/2206.00364.pdf
             timesteps_B_T=timesteps_B_T,  # Eq. 7 of https://arxiv.org/pdf/2206.00364.pdf
-            **condition.to_dict(),
+            crossattn_logit_boost=condition.crossattn_logit_boost,
+            solver_step_index=solver_step_index,
+            crossattn_logit_boost_spatial_weight=condition.crossattn_logit_boost_spatial_weight,
+            **net_kwargs,
         ).float()
 
         if condition.is_video and self.config.denoise_replace_gt_frames:
@@ -202,9 +211,9 @@ class Video2WorldModelRectifiedFlow(Text2WorldModelRectifiedFlow):
                 "parallel_state is not initialized, context parallel should be turned off."
             )
 
-        def velocity_fn(noise: torch.Tensor, noise_x: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
-            cond_v = self.denoise(noise, noise_x, timestep, condition)
-            uncond_v = self.denoise(noise, noise_x, timestep, uncondition)
+        def velocity_fn(noise: torch.Tensor, noise_x: torch.Tensor, timestep: torch.Tensor, solver_step_index: Optional[int] = None) -> torch.Tensor:
+            cond_v = self.denoise(noise, noise_x, timestep, condition, solver_step_index=solver_step_index)
+            uncond_v = self.denoise(noise, noise_x, timestep, uncondition, solver_step_index=solver_step_index)
             velocity_pred = cond_v + guidance * (cond_v - uncond_v)
             return velocity_pred
 

@@ -32,6 +32,7 @@ from typing_extensions import Self
 from cosmos_transfer2._src.imaginaire.flags import EXPERIMENTAL_CHECKPOINTS, SMOKE
 from cosmos_transfer2._src.imaginaire.utils import log
 from cosmos_transfer2._src.imaginaire.utils.checkpoint_db import CheckpointConfig, get_checkpoint_uri
+from cosmos_transfer2._src.transfer2.inference.t5_boost_phrase_span import t5_token_span_for_substring
 
 register_checkpoints()
 
@@ -308,6 +309,71 @@ class SetupArguments(CommonSetupArguments):
 Guidance = Annotated[int, pydantic.Field(ge=0, le=7)]
 
 
+class CrossAttnLogitBoostInference(pydantic.BaseModel):
+    """Cross-attention additive logit boost (text keys only). Requires attention backend minimal_a2a or torch.
+
+    For multi-instance editing (FOCUS), ``segments`` carries one (start, end) per instance group;
+    ``segment_start``/``segment_end`` are kept as a single-instance shorthand.
+    """
+
+    model_config = pydantic.ConfigDict(extra="forbid", frozen=True, use_attribute_docstrings=True)
+
+    segment_start: int | None = None
+    segment_end: int | None = None
+    """If omitted, set via CommonInferenceArguments.crossattn_boost_phrase_path + prompt (T5 only)."""
+    segments: list[tuple[int, int]] | None = None
+    """Per-instance T5 token spans. Resolved from CommonInferenceArguments.crossattn_boost_instances when omitted."""
+    creg: float
+    p: float
+    region_end_step: int | None = None
+    """If set with sampling, bias is applied only for solver step index in [0, region_end_step)."""
+
+    @pydantic.model_validator(mode="after")
+    def _segments_pair(self) -> Self:
+        s, e = self.segment_start, self.segment_end
+        if (s is None) ^ (e is None):
+            raise ValueError("segment_start and segment_end must both be set or both omitted")
+        if s is not None and e is not None and e <= s:
+            raise ValueError(f"segment_end must be greater than segment_start, got [{s}, {e})")
+
+        if self.segments is not None:
+            if s is not None or e is not None:
+                raise ValueError(
+                    "set either (segment_start, segment_end) or segments, not both"
+                )
+            if len(self.segments) == 0:
+                raise ValueError("segments must be non-empty when provided")
+            sorted_segs = sorted(self.segments, key=lambda x: x[0])
+            for i, (a, b) in enumerate(sorted_segs):
+                if b <= a:
+                    raise ValueError(f"segment {i} has non-positive length: [{a}, {b})")
+                if i > 0 and a < sorted_segs[i - 1][1]:
+                    raise ValueError(
+                        f"segments must be disjoint; got overlap between "
+                        f"{sorted_segs[i - 1]} and {sorted_segs[i]}"
+                    )
+        return self
+
+
+class BoostInstanceConfig(pydantic.BaseModel):
+    """One (mask, phrase) pair for FOCUS-style multi-instance cross-attention rectification.
+
+    ``phrase_path`` points to a .txt file whose contents are an exact contiguous substring of the
+    main prompt; ``mask_path`` is a video/image whose bright (or alpha) regions mark the instance.
+    """
+
+    model_config = pydantic.ConfigDict(extra="forbid", use_attribute_docstrings=True)
+
+    phrase_path: ResolvedFilePath
+    """Path to a .txt file holding the per-instance enhance phrase (must be a substring of the prompt)."""
+    mask_path: ResolvedFilePath
+    """Path to the per-instance spatial mask (.mp4/.png/...). Bright = inside instance region."""
+    mask_invert: bool = False
+    """If True, invert mask weights (1 - w) after loading."""
+    phrase_occurrence_index: int = 0
+    """Zero-based occurrence index when the phrase appears multiple times in the prompt."""
+
+
 class CommonInferenceArguments(pydantic.BaseModel):
     """Common inference arguments."""
 
@@ -330,6 +396,19 @@ class CommonInferenceArguments(pydantic.BaseModel):
     "Seed for generation randomness."
     guidance: Guidance = 3
     """Range from 0 to 7: the higher the value, the closer the generated video adheres to the prompt."""
+    crossattn_logit_boost: CrossAttnLogitBoostInference | None = None
+    """Optional cross-attention logit boost; passed through the conditioner into the DiT."""
+
+    crossattn_boost_phrase_path: ResolvedFilePath | None = None
+    """Path to a .txt file whose contents are a contiguous substring of the prompt; used with T5 to fill segment_start/end when those are omitted from crossattn_logit_boost."""
+    crossattn_boost_phrase_occurrence_index: int = 0
+    """Zero-based occurrence when the phrase appears multiple times in the prompt."""
+    crossattn_spatial_mask_path: ResolvedFilePath | None = None
+    """Optional mask video (e.g. .mp4); bright / high-alpha regions scale the cross-attn logit boost per latent position."""
+    crossattn_spatial_mask_invert: bool = False
+    """If True, invert mask weights (1 - w) after loading."""
+    crossattn_boost_instances: list[BoostInstanceConfig] | None = None
+    """Multi-instance FOCUS rectification: list of (phrase, mask) pairs. Mutually exclusive with crossattn_boost_phrase_path/crossattn_spatial_mask_path."""
 
     @pydantic.model_validator(mode="before")
     @classmethod
@@ -349,6 +428,84 @@ class CommonInferenceArguments(pydantic.BaseModel):
             data["prompt"] = prompt_path.read_text().strip()
             return data
         return data
+
+    @pydantic.model_validator(mode="after")
+    def _resolve_crossattn_boost_phrase_segments(self) -> Self:
+        boost = self.crossattn_logit_boost
+        if boost is None:
+            return self
+
+        single_instance_set = (
+            self.crossattn_boost_phrase_path is not None
+            or self.crossattn_spatial_mask_path is not None
+        )
+        multi_instance_set = self.crossattn_boost_instances is not None
+        if single_instance_set and multi_instance_set:
+            raise ValueError(
+                "crossattn_boost_instances is mutually exclusive with "
+                "crossattn_boost_phrase_path / crossattn_spatial_mask_path"
+            )
+
+        # Multi-instance branch: resolve every (phrase, mask) pair into a token span.
+        if multi_instance_set:
+            if boost.segment_start is not None or boost.segment_end is not None or boost.segments is not None:
+                raise ValueError(
+                    "do not set crossattn_logit_boost.segment_start/end/segments when "
+                    "crossattn_boost_instances is provided; segments are auto-resolved"
+                )
+            prompt = self.prompt
+            if not prompt:
+                raise ValueError("prompt is required to resolve crossattn_boost_instances")
+            resolved_segments: list[tuple[int, int]] = []
+            for idx, inst in enumerate(self.crossattn_boost_instances):
+                phrase = inst.phrase_path.read_text()
+                seg_s, seg_e = t5_token_span_for_substring(
+                    prompt,
+                    phrase,
+                    occurrence_index=inst.phrase_occurrence_index,
+                )
+                resolved_segments.append((seg_s, seg_e))
+                if is_rank0():
+                    log.info(
+                        f"[CROSSATTN_LOGIT_BOOST] Resolved instance {idx}: "
+                        f"segment=[{seg_s}, {seg_e}) "
+                        f"(occurrence_index={inst.phrase_occurrence_index}, "
+                        f"mask={inst.mask_path.name})"
+                    )
+            new_boost = boost.model_copy(update={"segments": resolved_segments})
+            return self.model_copy(update={"crossattn_logit_boost": new_boost})
+
+        # Single-instance backward-compat branch.
+        if boost.segment_start is not None and boost.segment_end is not None:
+            if self.crossattn_boost_phrase_path is not None:
+                log.warning(
+                    f"[{self.name}] crossattn_boost_phrase_path is ignored because segment_start/end are explicitly set."
+                )
+            return self
+
+        if self.crossattn_boost_phrase_path is None:
+            raise ValueError(
+                "crossattn_boost_phrase_path is required when crossattn_logit_boost is used "
+                "without explicitly setting segment_start and segment_end"
+            )
+
+        prompt = self.prompt
+        if not prompt:
+            raise ValueError("prompt is required to resolve crossattn_boost_phrase_path")
+
+        phrase = self.crossattn_boost_phrase_path.read_text()
+        seg_s, seg_e = t5_token_span_for_substring(
+            prompt,
+            phrase,
+            occurrence_index=self.crossattn_boost_phrase_occurrence_index,
+        )
+        new_boost = boost.model_copy(update={"segment_start": seg_s, "segment_end": seg_e})
+        if is_rank0():
+            log.info(
+                f"[CROSSATTN_LOGIT_BOOST] Resolved T5 token span from phrase file: "
+                f"segment=[{seg_s}, {seg_e}) (occurrence_index={self.crossattn_boost_phrase_occurrence_index})"
+            )
+        return self.model_copy(update={"crossattn_logit_boost": new_boost})
 
     @classmethod
     def _from_file(cls, path: Path, override_data: dict[str, Any]) -> list[Self]:
@@ -600,5 +757,9 @@ InferenceOverrides = get_overrides_cls(
         "depth",
         "vis",
         "seg",
+        # tyro 0.9.35 crashes on `list[PydanticModel] | None` inside an
+        # auto-generated Optional[...] override — see get_hints_for_signature_func
+        # bailing out for `list[BoostInstanceConfig]`.
+        "crossattn_boost_instances",
     ],
 )

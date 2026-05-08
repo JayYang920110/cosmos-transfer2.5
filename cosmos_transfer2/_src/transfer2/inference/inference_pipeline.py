@@ -45,6 +45,48 @@ from cosmos_transfer2._src.transfer2.inference.utils import (
     resize_video,
     uint8_to_normalized_float,
 )
+import torch.nn.functional as F_nn
+
+def _crossattn_mask_weights_from_cthw01(x_C_T_H_W: torch.Tensor) -> torch.Tensor:
+    """RGB(A) or gray tensor in [0, 1], shape (C, T, H, W) -> (1, T, H, W) weights."""
+    c = x_C_T_H_W.shape[0]
+    if c >= 4:
+        rgb = x_C_T_H_W[:3]
+        alpha = x_C_T_H_W[3:4]
+        lum = rgb.mean(dim=0, keepdim=True)
+        return torch.maximum(lum, alpha)
+    if c == 1:
+        return x_C_T_H_W
+    return x_C_T_H_W.mean(dim=0, keepdim=True)
+
+
+def load_crossattn_spatial_mask_to_match_video(
+    mask_path: str,
+    reference_bcthw: torch.Tensor,
+    invert: bool = False,
+) -> torch.Tensor:
+    """
+    Load a mask video and resample to (B, 1, T, H, W) float in [0, 1], matching reference_bcthw.
+
+    Bright regions and/or high alpha increase the weight. ``invert`` flips weights as (1 - w).
+    """
+    try:
+        mask_frames, mask_meta = easy_io.load(mask_path)
+        log.info(f"Loaded cross-attn spatial mask video shape {mask_frames.shape}, metadata: {mask_meta}")
+    except Exception as e:
+        raise ValueError(f"Failed to load mask video {mask_path}: {e}") from e
+
+    mask_tensor = torch.from_numpy(mask_frames).float() / 255.0
+    mask_tensor = mask_tensor.permute(3, 0, 1, 2)
+    weights_1_t_hw = _crossattn_mask_weights_from_cthw01(mask_tensor)
+
+    B, _C, T_t, H_t, W_t = reference_bcthw.shape
+    w = weights_1_t_hw.unsqueeze(0)
+    w = F_nn.interpolate(w, size=(T_t, H_t, W_t), mode="trilinear", align_corners=False)
+    if invert:
+        w = 1.0 - w
+    w = w.clamp(0.0, 1.0).expand(B, -1, -1, -1, -1).contiguous()
+    return w
 
 
 def _maybe_get_timer(
@@ -208,6 +250,8 @@ class ControlVideo2WorldInference:
         negative_prompt: str = None,
         control_weight: str = "1.0",
         image_context: torch.Tensor = None,
+        crossattn_logit_boost: dict | None = None,
+        crossattn_logit_boost_spatial_weight: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Prepares the input data batch for the diffusion model.
@@ -251,6 +295,13 @@ class ControlVideo2WorldInference:
             data_batch["image_context"] = image_context.to(
                 dtype=torch.bfloat16, device="cuda", non_blocking=True
             ).contiguous()
+
+        if crossattn_logit_boost is not None:
+            data_batch["crossattn_logit_boost"] = crossattn_logit_boost
+        if crossattn_logit_boost_spatial_weight is not None:
+            data_batch["crossattn_logit_boost_spatial_weight"] = crossattn_logit_boost_spatial_weight.to(
+                dtype=torch.bfloat16, device="cuda", non_blocking=True
+            )
 
         # Handle negative prompts for classifier-free guidance
         if negative_prompt is not None:
@@ -434,6 +485,10 @@ class ControlVideo2WorldInference:
         guided_generation_mask: str | None = None,
         guided_generation_step_threshold: int = 25,
         guided_generation_foreground_labels: list[int] | None = None,
+        crossattn_logit_boost: dict | None = None,
+        crossattn_spatial_mask_path: str | None = None,
+        crossattn_spatial_mask_invert: bool = False,
+        crossattn_boost_instance_masks: list[tuple[str, bool]] | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor], int, tuple[int, int]]:
         """
         Generates a video based on an input video and text prompt.
@@ -599,6 +654,36 @@ class ControlVideo2WorldInference:
                     control_weight=control_weight,
                     image_context=image_context,
                 )
+
+                if crossattn_logit_boost is not None:
+                    # Spatial mask(s) for crossattn boost. Output tensor is shape
+                    # (B, N, T, H, W) where N is the number of instance groups
+                    # (N=1 for the single-instance backward-compat path).
+                    full_spatial_mask_bcthw = None
+                    ref_bcthw = cur_input_frames.unsqueeze(0) if cur_input_frames.ndim == 4 else cur_input_frames
+                    if crossattn_boost_instance_masks is not None:
+                        per_instance = []
+                        for mask_path_i, mask_invert_i in crossattn_boost_instance_masks:
+                            # load_crossattn_spatial_mask_to_match_video returns (B, 1, T, H, W).
+                            mask_i = load_crossattn_spatial_mask_to_match_video(
+                                mask_path_i,
+                                ref_bcthw,
+                                invert=mask_invert_i,
+                            )
+                            per_instance.append(mask_i)
+                        # Concat along the channel/instance axis -> (B, N, T, H, W).
+                        full_spatial_mask_bcthw = torch.cat(per_instance, dim=1).cuda(non_blocking=True)
+                    elif crossattn_spatial_mask_path is not None:
+                        full_spatial_mask_bcthw = load_crossattn_spatial_mask_to_match_video(
+                            crossattn_spatial_mask_path,
+                            ref_bcthw,
+                            invert=crossattn_spatial_mask_invert,
+                        ).cuda(non_blocking=True)
+                    data_batch["crossattn_logit_boost"] = crossattn_logit_boost
+                    if full_spatial_mask_bcthw is not None:
+                        data_batch["crossattn_logit_boost_spatial_weight"] = full_spatial_mask_bcthw.to(
+                            dtype=torch.bfloat16, device="cuda", non_blocking=True
+                        )
 
                 # Process control inputs as specified in the hint_key list.
                 # If pre-computed control inputs are provided, load them into the data batch.

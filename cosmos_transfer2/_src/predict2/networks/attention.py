@@ -99,6 +99,7 @@ def attention(
     causal=False,
     deterministic=False,
     dtype=torch.bfloat16,
+    attn_logit_bias=None,
 ):
     supported_dtypes = [torch.bfloat16, torch.float16, torch.float32]
     is_half = dtype in [torch.bfloat16, torch.float16]
@@ -172,6 +173,7 @@ def attention(
                 q,
                 k,
                 v,
+                attn_mask=attn_logit_bias,
                 is_causal=causal,
                 dropout_p=dropout_p,
                 scale=softmax_scale,

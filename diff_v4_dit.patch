@@ -1,0 +1,391 @@
+--- /home/jay/cosmos-transfer2.5/cosmos_transfer2/_src/predict2/networks/minimal_v4_dit.py	2026-04-21 10:26:48.000000000 +0800
++++ /home/jay/cosmos-predict2.5/cosmos_predict2/_src/predict2/networks/minimal_v4_dit.py	2026-04-14 09:39:10.000000000 +0800
+@@ -15,13 +15,14 @@
+ 
+ import collections
+ import math
++import os
+ from collections import namedtuple
+ from collections.abc import Sequence
+ from dataclasses import dataclass
+ from enum import Enum
+ from typing import List, Optional, Tuple, Union
+ 
+-from cosmos_transfer2._src.predict2.utils.kv_cache import AttentionOpWithKVCache, KVCacheConfig
++from cosmos_predict2._src.predict2.utils.kv_cache import AttentionOpWithKVCache, KVCacheConfig
+ 
+ try:
+     import megatron.core.parallel_state as parallel_state
+@@ -33,6 +34,7 @@
+ import numpy as np
+ import torch
+ import torch.amp as amp
++import torch.nn.functional as F
+ import transformer_engine as te
+ from einops import rearrange, repeat
+ from einops.layers.torch import Rearrange
+@@ -54,14 +56,55 @@
+     from transformer_engine.pytorch.attention import apply_rotary_pos_emb
+ from torch.nn.attention.flex_attention import BlockMask, create_block_mask, flex_attention
+ 
+-from cosmos_transfer2._src.imaginaire.attention import attention
+-from cosmos_transfer2._src.imaginaire.utils import log
+-from cosmos_transfer2._src.imaginaire.utils.context_parallel import split_inputs_cp
+-from cosmos_transfer2._src.predict2.conditioner import DataType
+-from cosmos_transfer2._src.predict2.modules.neighborhood_attn import NeighborhoodAttention
+-from cosmos_transfer2._src.predict2.networks.a2a_cp import MinimalA2AAttnOp, NattenA2AAttnOp
+-from cosmos_transfer2._src.predict2.networks.model_weights_stats import WeightTrainingStat
+-from cosmos_transfer2._src.predict2.networks.selective_activation_checkpoint import SACConfig as _SACConfig
++from cosmos_predict2._src.imaginaire.attention import attention
++from cosmos_predict2._src.imaginaire.utils import log
++from cosmos_predict2._src.imaginaire.utils.context_parallel import split_inputs_cp
++from cosmos_predict2._src.predict2.conditioner import CrossAttnLogitBoostParams, DataType
++from cosmos_predict2._src.predict2.modules.neighborhood_attn import NeighborhoodAttention
++from cosmos_predict2._src.predict2.networks.a2a_cp import MinimalA2AAttnOp, NattenA2AAttnOp
++from cosmos_predict2._src.predict2.networks.model_weights_stats import WeightTrainingStat
++from cosmos_predict2._src.predict2.networks.selective_activation_checkpoint import SACConfig as _SACConfig
++
++_CROSSATTN_BOOST_CONFIRM_LOGGED = False
++_CROSSATTN_BOOST_WARN_BACKEND_LOGGED = False
++_MINITRAIN_BOOST_PARAMS_LOGGED_ONCE = False
++
++
++def _crossattn_boost_logging_enabled() -> bool:
++    return os.environ.get("COSMOS_CROSSATTN_BOOST_SILENT", "").lower() not in ("1", "true", "yes")
++
++
++def _log_crossattn_boost_backend_unsupported_once(backend: str) -> None:
++    global _CROSSATTN_BOOST_WARN_BACKEND_LOGGED
++    if not _crossattn_boost_logging_enabled() or _CROSSATTN_BOOST_WARN_BACKEND_LOGGED:
++        return
++    log.warning(
++        f"crossattn_logit_boost is set but cross_attn backend={backend!r} does not support additive bias "
++        "(needs minimal_a2a or torch). Set COSMOS_CROSSATTN_BOOST_SILENT=1 to hide this warning."
++    )
++    _CROSSATTN_BOOST_WARN_BACKEND_LOGGED = True
++
++
++def _log_crossattn_boost_applied_once(
++    *,
++    backend: str,
++    bias_shape: tuple[int, ...],
++    seg_lo: int,
++    seg_hi: int,
++    n_text: int,
++    solver_step_index: Optional[int],
++    alpha_abs_max: float,
++) -> None:
++    global _CROSSATTN_BOOST_CONFIRM_LOGGED
++    if not _crossattn_boost_logging_enabled() or _CROSSATTN_BOOST_CONFIRM_LOGGED:
++        return
++    log.info(
++        f"[CROSSATTN_LOGIT_BOOST_PROOF] Block built additive bias on text keys [{seg_lo}, {seg_hi}) n_text={n_text}, "
++        f"bias shape={tuple(bias_shape)}, backend={backend!r}, solver_step_index={solver_step_index}, "
++        f"max|creg*treg|≈{alpha_abs_max:.6g}. "
++        "Also look for [CROSSATTN_LOGIT_BOOST_PROOF] in predict2.networks.attention when minimal_a2a runs."
++    )
++    _CROSSATTN_BOOST_CONFIRM_LOGGED = True
+ 
+ 
+ # selective activation checkpoint; only apply to the minimal v4 model. if there are change in the networks, some policy will not work as we expect.
+@@ -72,7 +115,7 @@
+         mode = "recompute" if ctx.is_recompute else "forward"
+         if func == torch.ops.aten.mm.default:
+             op_count_key = f"{mode}_mm_count"
+-            # from cosmos_transfer2._src.imaginaire.utils import log
++            # from cosmos_predict2._src.imaginaire.utils import log
+             # log.info(f"op_count_key: {op_count_key}, op_count[op_count_key]: {op_count[op_count_key]}, {args[0].shape}, {args[1].shape}")
+             # there are totally 6 + 4 + 4 + 2 = 16 block
+             op_count[op_count_key] = (op_count[op_count_key] + 1) % 16
+@@ -130,7 +173,7 @@
+         mode = "recompute" if ctx.is_recompute else "forward"
+         if func == torch.ops.aten.mm.default:
+             op_count_key = f"{mode}_mm_count"
+-            # from cosmos_transfer2._src.imaginaire.utils import log
++            # from cosmos_predict2._src.imaginaire.utils import log
+             # log.info(f"op_count_key: {op_count_key}, op_count[op_count_key]: {op_count[op_count_key]}, {args[0].shape}, {args[1].shape}")
+             # there are totally 6 + 4 + 4 + 2 = 16 block
+             op_count[op_count_key] = (op_count[op_count_key] + 1) % 16
+@@ -546,12 +589,18 @@
+         v,
+         video_size: Optional[VideoSize] = None,
+         kv_cache_cfg: Optional[KVCacheConfig] = None,
++        attn_logit_bias: Optional[torch.Tensor] = None,
+     ):
+         additional_args = {}
+         if isinstance(self.attn_op, (NattenA2AAttnOp, NeighborhoodAttention)) or self.backend == "i4":
+             additional_args["video_size"] = video_size
+         if isinstance(self.attn_op, AttentionOpWithKVCache):
+             additional_args["kv_cache_cfg"] = kv_cache_cfg
++        if attn_logit_bias is not None:
++            if self.backend == "minimal_a2a":
++                additional_args["attn_bias"] = attn_logit_bias
++            elif self.backend == "torch":
++                additional_args["attn_mask"] = attn_logit_bias
+ 
+         result = self.attn_op(q, k, v, **additional_args)  # [B, S, H, D]
+         return self.output_dropout(self.output_proj(result))
+@@ -563,6 +612,7 @@
+         rope_emb: Optional[torch.Tensor] = None,
+         video_size: Optional[VideoSize] = None,
+         kv_cache_cfg: Optional[KVCacheConfig] = None,
++        attn_logit_bias: Optional[torch.Tensor] = None,
+     ):
+         """
+         Args:
+@@ -572,7 +622,10 @@
+             video_size(VideoSize): Shape [T, H, W]
+         """
+         q, k, v = self.compute_qkv(x, context, rope_emb=rope_emb)
+-        return self.compute_attention(q, k, v, video_size=video_size, kv_cache_cfg=kv_cache_cfg)
++        cross_bias = attn_logit_bias if context is not None else None
++        return self.compute_attention(
++            q, k, v, video_size=video_size, kv_cache_cfg=kv_cache_cfg, attn_logit_bias=cross_bias
++        )
+ 
+     def set_context_parallel_group(self, process_group, ranks, stream, cp_comm_type: str = "p2p"):
+         # self.attn_op.set_context_parallel_group(process_group, ranks, stream, cp_comm_type="a2a")
+@@ -608,8 +661,22 @@
+ 
+         return q, k, v, self.k_img_norm(k_img), v_img
+ 
+-    def compute_attention(self, q, k, v, k_img, v_img):
+-        result = self.attn_op(q, k, v)  # [B, S, H, D]
++    def compute_attention(
++        self,
++        q,
++        k,
++        v,
++        k_img,
++        v_img,
++        attn_logit_bias: Optional[torch.Tensor] = None,
++    ):
++        extra = {}
++        if attn_logit_bias is not None:
++            if self.backend == "minimal_a2a":
++                extra["attn_bias"] = attn_logit_bias
++            elif self.backend == "torch":
++                extra["attn_mask"] = attn_logit_bias
++        result = self.attn_op(q, k, v, **extra)  # [B, S, H, D]
+         result_img = self.attn_op(q, k_img, v_img)
+         return self.output_dropout(self.output_proj(result + result_img))
+ 
+@@ -618,9 +685,10 @@
+         x,
+         context=None,
+         rope_emb=None,
++        attn_logit_bias: Optional[torch.Tensor] = None,
+     ):
+         q, k, v, k_img, v_img = self.compute_qkv(x, context, rope_emb)
+-        return self.compute_attention(q, k, v, k_img, v_img)
++        return self.compute_attention(q, k, v, k_img, v_img, attn_logit_bias=attn_logit_bias)
+ 
+ 
+ class VideoPositionEmb(nn.Module):
+@@ -1254,15 +1322,140 @@
+         self.cross_attn.init_weights()
+         self.mlp.init_weights()
+ 
++    def _maybe_cross_attn_logit_bias(
++        self,
++        timesteps_B_T: torch.Tensor,
++        crossattn_logit_boost: Optional[CrossAttnLogitBoostParams],
++        solver_step_index: Optional[int],
++        x_B_T_H_W_D: torch.Tensor,
++        crossattn_emb: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
++        crossattn_logit_boost_spatial_weight: Optional[torch.Tensor] = None,
++    ) -> Optional[torch.Tensor]:
++        if crossattn_logit_boost is None:
++            return None
++        if self.cross_attn.backend not in ("minimal_a2a", "torch"):
++            _log_crossattn_boost_backend_unsupported_once(self.cross_attn.backend)
++            return None
++        seg_s, seg_e = crossattn_logit_boost.segment_start, crossattn_logit_boost.segment_end
++        if seg_e <= seg_s:
++            return None
++        reg_end = crossattn_logit_boost.region_end_step
++        if reg_end is not None and solver_step_index is not None and solver_step_index >= reg_end:
++            return None
++
++        if isinstance(crossattn_emb, tuple):
++            text_emb = crossattn_emb[0]
++        else:
++            text_emb = crossattn_emb
++        _B, n_text, _D = text_emb.shape
++        if seg_s >= n_text or seg_e <= 0:
++            return None
++        seg_s_clamped = max(0, seg_s)
++        seg_e_clamped = min(n_text, seg_e)
++        if seg_e_clamped <= seg_s_clamped:
++            return None
++
++        B, T, H, W, _ = x_B_T_H_W_D.shape
++        if timesteps_B_T.ndim == 1:
++            ts = timesteps_B_T.unsqueeze(1).float()
++        else:
++            ts = timesteps_B_T.float()
++        # Map to a (0, 1]-ish noise-level scale for treg = t_norm**p.
++        # Raw rectified-flow / DDPM-style timesteps are often in [0, 1000]; then t_norm = ts/1000.
++        # MinimalV1LVGDiT (and similar) multiply by timestep_scale (e.g. 0.001) before MiniTrainDIT, so ts
++        # is already ~O(1); dividing by 1000 again makes t_norm ~1e-3 and t_norm**p negligible (~1e-15 for p=5).
++        t_norm = torch.where(ts > 1.5, ts / 1000.0, ts)
++        treg = t_norm**crossattn_logit_boost.p
++        alpha = (crossattn_logit_boost.creg * treg).to(dtype=x_B_T_H_W_D.dtype)
++
++        Lq = T * H * W
++        # Broadcast alpha to (B, 1, Lq, 1) so it adds correctly over the key segment
++        # [B,H,Lq,seg]. Video2World can pass per-frame timesteps (B, T), so alpha may be (B, T).
++        if alpha.ndim == 2 and alpha.shape[0] == B and alpha.shape[1] == T:
++            alpha_b_1_lq_1 = rearrange(
++                alpha[:, :, None, None].expand(B, T, H, W),
++                "b t h w -> b 1 (t h w) 1",
++            )
++        elif alpha.ndim == 2 and alpha.shape[0] == B and alpha.shape[1] == 1:
++            alpha_b_1_lq_1 = alpha.reshape(B, 1, 1, 1).expand(B, 1, Lq, 1)
++        elif alpha.ndim == 1:
++            if alpha.numel() == B * T:
++                alpha_bt = alpha.view(B, T)
++                alpha_b_1_lq_1 = rearrange(
++                    alpha_bt[:, :, None, None].expand(B, T, H, W),
++                    "b t h w -> b 1 (t h w) 1",
++                )
++            elif alpha.numel() == B:
++                alpha_b_1_lq_1 = alpha.view(B, 1, 1, 1).expand(B, 1, Lq, 1)
++            elif alpha.numel() == T and B == 1:
++                alpha_b_1_lq_1 = rearrange(
++                    alpha.view(1, T, 1, 1).expand(1, T, H, W),
++                    "b t h w -> b 1 (t h w) 1",
++                )
++            else:
++                raise RuntimeError(
++                    "crossattn_logit_boost: cannot broadcast alpha from timesteps "
++                    f"shape={tuple(timesteps_B_T.shape)} (alpha numel={alpha.numel()}) "
++                    f"to spatial tokens B={B}, T={T}, H={H}, W={W}, Lq={Lq}."
++                )
++        elif alpha.ndim == 0:
++            alpha_b_1_lq_1 = alpha.view(1, 1, 1, 1).expand(B, 1, Lq, 1)
++        else:
++            raise RuntimeError(
++                "crossattn_logit_boost: unexpected alpha shape "
++                f"{tuple(alpha.shape)} for timesteps {tuple(timesteps_B_T.shape)}, "
++                f"x (B,T,H,W)=({B},{T},{H},{W})."
++            )
++
++        if crossattn_logit_boost_spatial_weight is not None:
++            w = crossattn_logit_boost_spatial_weight
++            if w.shape[0] != B:
++                raise RuntimeError(
++                    "crossattn_logit_boost_spatial_weight batch mismatch: "
++                    f"expected B={B}, got shape {tuple(w.shape)}"
++                )
++            w = w.to(device=x_B_T_H_W_D.device, dtype=torch.float32)
++            if w.shape[2] != T or w.shape[3] != H or w.shape[4] != W:
++                w = F.interpolate(w, size=(T, H, W), mode="trilinear", align_corners=False)
++            w = w.to(dtype=alpha_b_1_lq_1.dtype)
++            spatial_b_1_lq_1 = rearrange(w, "b 1 t h w -> b 1 (t h w) 1")
++            alpha_b_1_lq_1 = alpha_b_1_lq_1 * spatial_b_1_lq_1
++
++        n_heads = self.cross_attn.n_heads
++        attn_bias = torch.zeros(
++            B,
++            n_heads,
++            Lq,
++            n_text,
++            device=x_B_T_H_W_D.device,
++            dtype=x_B_T_H_W_D.dtype,
++        )
++        attn_bias[:, :, :, seg_s_clamped:seg_e_clamped] += alpha_b_1_lq_1
++        alpha_abs_max = float(alpha.detach().abs().max().item())
++        _log_crossattn_boost_applied_once(
++            backend=self.cross_attn.backend,
++            bias_shape=tuple(attn_bias.shape),
++            seg_lo=seg_s_clamped,
++            seg_hi=seg_e_clamped,
++            n_text=n_text,
++            solver_step_index=solver_step_index,
++            alpha_abs_max=alpha_abs_max,
++        )
++        return attn_bias
++
+     def forward(
+         self,
+         x_B_T_H_W_D: torch.Tensor,
+         emb_B_T_D: torch.Tensor,
+-        crossattn_emb: torch.Tensor,
++        crossattn_emb: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+         rope_emb_L_1_1_D: Optional[torch.Tensor] = None,
+         adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
+         extra_per_block_pos_emb: Optional[torch.Tensor] = None,
+         kv_cache_cfg: Optional[KVCacheConfig] = None,
++        timesteps_B_T: Optional[torch.Tensor] = None,
++        crossattn_logit_boost: Optional[CrossAttnLogitBoostParams] = None,
++        solver_step_index: Optional[int] = None,
++        crossattn_logit_boost_spatial_weight: Optional[torch.Tensor] = None,
+     ) -> torch.Tensor:
+         if extra_per_block_pos_emb is not None:
+             x_B_T_H_W_D = x_B_T_H_W_D + extra_per_block_pos_emb
+@@ -1338,6 +1531,17 @@
+         )
+         x_B_T_H_W_D = x_B_T_H_W_D + gate_self_attn_B_T_1_1_D * result_B_T_H_W_D
+ 
++        attn_logit_bias_B_H_Lq_Lk = None
++        if timesteps_B_T is not None:
++            attn_logit_bias_B_H_Lq_Lk = self._maybe_cross_attn_logit_bias(
++                timesteps_B_T,
++                crossattn_logit_boost,
++                solver_step_index,
++                x_B_T_H_W_D,
++                crossattn_emb,
++                crossattn_logit_boost_spatial_weight,
++            )
++
+         def _x_fn(
+             _x_B_T_H_W_D,
+             layer_norm_cross_attn,
+@@ -1353,6 +1557,7 @@
+                     rearrange(_normalized_x_B_T_H_W_D, "b t h w d -> b (t h w) d"),
+                     crossattn_emb,
+                     rope_emb=rope_emb_L_1_1_D,
++                    attn_logit_bias=attn_logit_bias_B_H_Lq_Lk,
+                 ),
+                 "b (t h w) d -> b t h w d",
+                 t=T,
+@@ -1719,6 +1924,9 @@
+         data_type: Optional[DataType] = DataType.VIDEO,
+         intermediate_feature_ids: Optional[List[int]] = None,
+         img_context_emb: Optional[torch.Tensor] = None,
++        crossattn_logit_boost: Optional[CrossAttnLogitBoostParams] = None,
++        solver_step_index: Optional[int] = None,
++        crossattn_logit_boost_spatial_weight: Optional[torch.Tensor] = None,
+     ) -> torch.Tensor | List[torch.Tensor] | Tuple[torch.Tensor, List[torch.Tensor]]:
+         """
+         Args:
+@@ -1747,6 +1955,17 @@
+         else:
+             context_input = crossattn_emb
+ 
++        if crossattn_logit_boost is not None and _crossattn_boost_logging_enabled():
++            global _MINITRAIN_BOOST_PARAMS_LOGGED_ONCE
++            if not _MINITRAIN_BOOST_PARAMS_LOGGED_ONCE:
++                cb = crossattn_logit_boost
++                log.info(
++                    f"[CROSSATTN_LOGIT_BOOST] MiniTrainDIT.forward received boost params: "
++                    f"segment=[{cb.segment_start},{cb.segment_end}), creg={cb.creg}, p={cb.p}, "
++                    f"region_end_step={cb.region_end_step}, solver_step_index={solver_step_index}"
++                )
++                _MINITRAIN_BOOST_PARAMS_LOGGED_ONCE = True
++
+         with amp.autocast("cuda", enabled=self.use_wan_fp32_strategy, dtype=torch.float32):
+             if timesteps_B_T.ndim == 1:
+                 timesteps_B_T = timesteps_B_T.unsqueeze(1)
+@@ -1777,6 +1996,10 @@
+                 rope_emb_L_1_1_D=rope_emb_L_1_1_D,
+                 adaln_lora_B_T_3D=adaln_lora_B_T_3D,
+                 extra_per_block_pos_emb=extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D,
++                timesteps_B_T=timesteps_B_T,
++                crossattn_logit_boost=crossattn_logit_boost,
++                solver_step_index=solver_step_index,
++                crossattn_logit_boost_spatial_weight=crossattn_logit_boost_spatial_weight,
+             )
+             if intermediate_feature_ids and i in intermediate_feature_ids:
+                 x_reshaped_for_disc = rearrange(x_B_T_H_W_D, "b tp hp wp d -> b (tp hp wp) d")

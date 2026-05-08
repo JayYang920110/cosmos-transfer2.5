@@ -33,6 +33,7 @@ except ImportError:
 import numpy as np
 import torch
 import torch.amp as amp
+import os
 import transformer_engine as te
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
@@ -57,11 +58,48 @@ from torch.nn.attention.flex_attention import BlockMask, create_block_mask, flex
 from cosmos_transfer2._src.imaginaire.attention import attention
 from cosmos_transfer2._src.imaginaire.utils import log
 from cosmos_transfer2._src.imaginaire.utils.context_parallel import split_inputs_cp
-from cosmos_transfer2._src.predict2.conditioner import DataType
+from cosmos_transfer2._src.predict2.conditioner import CrossAttnLogitBoostParams, DataType
 from cosmos_transfer2._src.predict2.modules.neighborhood_attn import NeighborhoodAttention
 from cosmos_transfer2._src.predict2.networks.a2a_cp import MinimalA2AAttnOp, NattenA2AAttnOp
 from cosmos_transfer2._src.predict2.networks.model_weights_stats import WeightTrainingStat
 from cosmos_transfer2._src.predict2.networks.selective_activation_checkpoint import SACConfig as _SACConfig
+
+_CROSSATTN_BOOST_CONFIRM_LOGGED = False
+_CROSSATTN_BOOST_WARN_BACKEND_LOGGED = False
+
+def _crossattn_boost_logging_enabled() -> bool:
+    return os.environ.get("COSMOS_CROSSATTN_BOOST_SILENT", "").lower() not in ("1", "true", "yes")
+
+def _log_crossattn_boost_backend_unsupported_once(backend: str) -> None:
+    global _CROSSATTN_BOOST_WARN_BACKEND_LOGGED
+    if not _crossattn_boost_logging_enabled() or _CROSSATTN_BOOST_WARN_BACKEND_LOGGED:
+        return
+    log.warning(
+        f"crossattn_logit_boost is set but cross_attn backend={backend!r} does not support additive bias "
+        "(needs minimal_a2a or torch). Set COSMOS_CROSSATTN_BOOST_SILENT=1 to hide this warning."
+    )
+    _CROSSATTN_BOOST_WARN_BACKEND_LOGGED = True
+
+def _log_crossattn_boost_applied_once(
+    *,
+    backend: str,
+    bias_shape: tuple[int, ...],
+    seg_lo: int,
+    seg_hi: int,
+    n_text: int,
+    solver_step_index: Optional[int],
+    alpha_abs_max: float,
+) -> None:
+    global _CROSSATTN_BOOST_CONFIRM_LOGGED
+    if not _crossattn_boost_logging_enabled() or _CROSSATTN_BOOST_CONFIRM_LOGGED:
+        return
+    log.info(
+        f"[CROSSATTN_LOGIT_BOOST_PROOF] Block built additive bias on text keys [{seg_lo}, {seg_hi}) n_text={n_text}, "
+        f"bias shape={tuple(bias_shape)}, backend={backend!r}, solver_step_index={solver_step_index}, "
+        f"max|creg*treg|≈{alpha_abs_max:.6g}. "
+        "Also look for [CROSSATTN_LOGIT_BOOST_PROOF] in predict2.networks.attention when minimal_a2a runs."
+    )
+    _CROSSATTN_BOOST_CONFIRM_LOGGED = True
 
 
 # selective activation checkpoint; only apply to the minimal v4 model. if there are change in the networks, some policy will not work as we expect.
@@ -608,8 +646,11 @@ class I2VCrossAttention(Attention):
 
         return q, k, v, self.k_img_norm(k_img), v_img
 
-    def compute_attention(self, q, k, v, k_img, v_img):
-        result = self.attn_op(q, k, v)  # [B, S, H, D]
+    def compute_attention(self, q, k, v, k_img, v_img, attn_logit_bias=None):
+        if attn_logit_bias is not None:
+            result = torch_attention_op(q, k, v, attn_mask=attn_logit_bias)  # [B, S, H, D]
+        else:
+            result = self.attn_op(q, k, v)  # [B, S, H, D]
         result_img = self.attn_op(q, k_img, v_img)
         return self.output_dropout(self.output_proj(result + result_img))
 
@@ -618,9 +659,10 @@ class I2VCrossAttention(Attention):
         x,
         context=None,
         rope_emb=None,
+        attn_logit_bias=None,
     ):
         q, k, v, k_img, v_img = self.compute_qkv(x, context, rope_emb)
-        return self.compute_attention(q, k, v, k_img, v_img)
+        return self.compute_attention(q, k, v, k_img, v_img, attn_logit_bias=attn_logit_bias)
 
 
 class VideoPositionEmb(nn.Module):
@@ -1254,6 +1296,189 @@ class Block(nn.Module):
         self.cross_attn.init_weights()
         self.mlp.init_weights()
 
+    def _maybe_cross_attn_logit_bias(
+        self,
+        timesteps_B_T: torch.Tensor,
+        crossattn_logit_boost: Optional[CrossAttnLogitBoostParams],
+        solver_step_index: Optional[int],
+        x_B_T_H_W_D: torch.Tensor,
+        crossattn_emb: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        crossattn_logit_boost_spatial_weight: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        """FOCUS-style additive cross-attention rectification.
+
+        Builds a (B, 1, Lq, n_text) bias added to pre-softmax cross-attention logits. For each
+        instance group i with mask m_i and segment c_i, queries inside m_i receive +alpha_i on
+        keys in c_i (Improve) and -alpha_i on keys in any other instance's segment c_j, j != i
+        (Suppress). Tokens that are not part of any instance segment are left untouched, so
+        shared/contextual prompt tokens are not over-suppressed.
+
+        alpha_i = creg * t_norm**p * (1 - s_r,i) * mask_i, where s_r,i is the normalized spatial
+        extent of instance i averaged over the latent (T, H, W) volume.
+        """
+        import torch.nn.functional as F
+        if crossattn_logit_boost is None:
+            return None
+        if self.cross_attn.backend not in ("minimal_a2a", "torch"):
+            _log_crossattn_boost_backend_unsupported_once(self.cross_attn.backend)
+            return None
+        reg_end = crossattn_logit_boost.region_end_step
+        if reg_end is not None and solver_step_index is not None and solver_step_index >= reg_end:
+            return None
+
+        # Normalize segment specification: prefer multi-instance ``segments``, fall back to the
+        # legacy single-instance (segment_start, segment_end) pair.
+        raw_segments = getattr(crossattn_logit_boost, "segments", None)
+        if raw_segments is None:
+            seg_s = crossattn_logit_boost.segment_start
+            seg_e = crossattn_logit_boost.segment_end
+            if seg_s is None or seg_e is None or seg_e <= seg_s:
+                return None
+            raw_segments = [(seg_s, seg_e)]
+        if len(raw_segments) == 0:
+            return None
+
+        if isinstance(crossattn_emb, tuple):
+            text_emb = crossattn_emb[0]
+        else:
+            text_emb = crossattn_emb
+        _B, n_text, _D = text_emb.shape
+
+        # Clamp segments to [0, n_text); drop empties.
+        segments: List[Tuple[int, int]] = []
+        for s, e in raw_segments:
+            if s >= n_text or e <= 0:
+                continue
+            s_c = max(0, int(s))
+            e_c = min(n_text, int(e))
+            if e_c > s_c:
+                segments.append((s_c, e_c))
+        if len(segments) == 0:
+            return None
+        N = len(segments)
+
+        B, T, H, W, _ = x_B_T_H_W_D.shape
+        Lq = T * H * W
+
+        if timesteps_B_T.ndim == 1:
+            ts = timesteps_B_T.unsqueeze(1).float()
+        else:
+            ts = timesteps_B_T.float()
+        # Map to a (0, 1]-ish noise-level scale for treg = t_norm**p.
+        t_norm = torch.where(ts > 1.5, ts / 1000.0, ts)
+        treg = t_norm**crossattn_logit_boost.p
+        alpha_base = (crossattn_logit_boost.creg * treg).to(dtype=x_B_T_H_W_D.dtype)
+
+        # Broadcast alpha_base into shape (B, 1, Lq, 1) so per-instance scaling and per-token
+        # spatial gating compose by simple multiplication later.
+        if alpha_base.ndim == 2 and alpha_base.shape[0] == B and alpha_base.shape[1] == T:
+            alpha_b_1_lq_1 = rearrange(
+                alpha_base[:, :, None, None].expand(B, T, H, W),
+                "b t h w -> b 1 (t h w) 1",
+            )
+        elif alpha_base.ndim == 2 and alpha_base.shape[0] == B and alpha_base.shape[1] == 1:
+            alpha_b_1_lq_1 = alpha_base.reshape(B, 1, 1, 1).expand(B, 1, Lq, 1)
+        elif alpha_base.ndim == 1:
+            if alpha_base.numel() == B * T:
+                alpha_bt = alpha_base.view(B, T)
+                alpha_b_1_lq_1 = rearrange(
+                    alpha_bt[:, :, None, None].expand(B, T, H, W),
+                    "b t h w -> b 1 (t h w) 1",
+                )
+            elif alpha_base.numel() == B:
+                alpha_b_1_lq_1 = alpha_base.view(B, 1, 1, 1).expand(B, 1, Lq, 1)
+            elif alpha_base.numel() == T and B == 1:
+                alpha_b_1_lq_1 = rearrange(
+                    alpha_base.view(1, T, 1, 1).expand(1, T, H, W),
+                    "b t h w -> b 1 (t h w) 1",
+                )
+            else:
+                raise RuntimeError(
+                    "crossattn_logit_boost: cannot broadcast alpha from timesteps "
+                    f"shape={tuple(timesteps_B_T.shape)} (alpha numel={alpha_base.numel()}) "
+                    f"to spatial tokens B={B}, T={T}, H={H}, W={W}, Lq={Lq}."
+                )
+        elif alpha_base.ndim == 0:
+            alpha_b_1_lq_1 = alpha_base.view(1, 1, 1, 1).expand(B, 1, Lq, 1)
+        else:
+            raise RuntimeError(
+                "crossattn_logit_boost: unexpected alpha shape "
+                f"{tuple(alpha_base.shape)} for timesteps {tuple(timesteps_B_T.shape)}, "
+                f"x (B,T,H,W)=({B},{T},{H},{W})."
+            )
+
+        # Build per-instance per-query alpha tensor of shape (B, N, Lq, 1).
+        if crossattn_logit_boost_spatial_weight is not None:
+            w = crossattn_logit_boost_spatial_weight
+            if w.shape[0] != B:
+                raise RuntimeError(
+                    "crossattn_logit_boost_spatial_weight batch mismatch: "
+                    f"expected B={B}, got shape {tuple(w.shape)}"
+                )
+            if w.shape[1] != N:
+                raise RuntimeError(
+                    "crossattn_logit_boost_spatial_weight has "
+                    f"{w.shape[1]} mask channel(s) but {N} segment(s) were provided"
+                )
+            w = w.to(device=x_B_T_H_W_D.device, dtype=torch.float32)
+            if w.shape[2] != T or w.shape[3] != H or w.shape[4] != W:
+                # F.interpolate expects (B*N, 1, T, H, W); fold N into B for resize.
+                w = w.reshape(B * N, 1, w.shape[2], w.shape[3], w.shape[4])
+                w = F.interpolate(w, size=(T, H, W), mode="trilinear", align_corners=False)
+                w = w.reshape(B, N, T, H, W)
+            # (1 - s_r,i): per-instance scalar that damps alpha as the region grows. Computed in
+            # fp32 from the (clamped) mask volume mean before casting to alpha's dtype.
+            size_factor_b_n = 1.0 - w.mean(dim=(2, 3, 4)).clamp(0.0, 1.0)  # (B, N)
+            w = w.to(dtype=alpha_b_1_lq_1.dtype)
+            # (B, N, T, H, W) -> (B, N, Lq, 1)
+            spatial_b_n_lq_1 = rearrange(w, "b n t h w -> b n (t h w) 1")
+            size_factor_b_n_1_1 = size_factor_b_n.to(dtype=alpha_b_1_lq_1.dtype)[:, :, None, None]
+            alpha_b_n_lq_1 = alpha_b_1_lq_1 * size_factor_b_n_1_1 * spatial_b_n_lq_1
+        else:
+            if N > 1:
+                raise RuntimeError(
+                    "crossattn_logit_boost: spatial_weight is required when more than one "
+                    "segment is provided (multi-instance rectification)"
+                )
+            # No spatial gating: full-frame Improve on the single segment. The middle dim is
+            # already 1 (head-broadcast slot), which doubles as the N=1 instance axis.
+            alpha_b_n_lq_1 = alpha_b_1_lq_1
+
+        n_heads_for_bias = 1
+        attn_bias = torch.zeros(
+            B,
+            n_heads_for_bias,
+            Lq,
+            n_text,
+            device=x_B_T_H_W_D.device,
+            dtype=x_B_T_H_W_D.dtype,
+        )
+        # FOCUS Improve + Suppress, accumulated across instances. Bias is additive so the order
+        # of the loop does not affect the result.
+        for i, (s_i, e_i) in enumerate(segments):
+            alpha_i = alpha_b_n_lq_1[:, i : i + 1]  # (B, 1, Lq, 1)
+            # Improve: queries inside m_i attend more strongly to their own segment c_i.
+            attn_bias[:, :, :, s_i:e_i] += alpha_i
+            # Suppress: those same queries attend less to OTHER instances' segments c_j (j != i).
+            for j, (s_j, e_j) in enumerate(segments):
+                if j == i:
+                    continue
+                attn_bias[:, :, :, s_j:e_j] -= alpha_i
+
+        alpha_abs_max = float(alpha_base.detach().abs().max().item())
+        seg_lo = min(s for s, _ in segments)
+        seg_hi = max(e for _, e in segments)
+        _log_crossattn_boost_applied_once(
+            backend=self.cross_attn.backend,
+            bias_shape=tuple(attn_bias.shape),
+            seg_lo=seg_lo,
+            seg_hi=seg_hi,
+            n_text=n_text,
+            solver_step_index=solver_step_index,
+            alpha_abs_max=alpha_abs_max,
+        )
+        return attn_bias
+
     def forward(
         self,
         x_B_T_H_W_D: torch.Tensor,
@@ -1263,6 +1488,10 @@ class Block(nn.Module):
         adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
         extra_per_block_pos_emb: Optional[torch.Tensor] = None,
         kv_cache_cfg: Optional[KVCacheConfig] = None,
+        timesteps_B_T: Optional[torch.Tensor] = None,
+        crossattn_logit_boost: Optional[CrossAttnLogitBoostParams] = None,
+        solver_step_index: Optional[int] = None,
+        crossattn_logit_boost_spatial_weight: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if extra_per_block_pos_emb is not None:
             x_B_T_H_W_D = x_B_T_H_W_D + extra_per_block_pos_emb
@@ -1348,11 +1577,21 @@ class Block(nn.Module):
             _normalized_x_B_T_H_W_D = _fn(
                 _x_B_T_H_W_D, layer_norm_cross_attn, _scale_cross_attn_B_T_1_1_D, _shift_cross_attn_B_T_1_1_D
             )
+            attn_logit_bias = self._maybe_cross_attn_logit_bias(
+                timesteps_B_T=timesteps_B_T,
+                crossattn_logit_boost=crossattn_logit_boost,
+                solver_step_index=solver_step_index,
+                x_B_T_H_W_D=_x_B_T_H_W_D,
+                crossattn_emb=crossattn_emb,
+                crossattn_logit_boost_spatial_weight=crossattn_logit_boost_spatial_weight,
+            )
+
             _result_B_T_H_W_D = rearrange(
                 self.cross_attn(
                     rearrange(_normalized_x_B_T_H_W_D, "b t h w d -> b (t h w) d"),
                     crossattn_emb,
                     rope_emb=rope_emb_L_1_1_D,
+                    attn_logit_bias=attn_logit_bias,
                 ),
                 "b (t h w) d -> b t h w d",
                 t=T,
@@ -1719,6 +1958,9 @@ class MiniTrainDIT(WeightTrainingStat):
         data_type: Optional[DataType] = DataType.VIDEO,
         intermediate_feature_ids: Optional[List[int]] = None,
         img_context_emb: Optional[torch.Tensor] = None,
+        crossattn_logit_boost: Optional[CrossAttnLogitBoostParams] = None,
+        solver_step_index: Optional[int] = None,
+        crossattn_logit_boost_spatial_weight: Optional[torch.Tensor] = None,
     ) -> torch.Tensor | List[torch.Tensor] | Tuple[torch.Tensor, List[torch.Tensor]]:
         """
         Args:
@@ -1777,6 +2019,10 @@ class MiniTrainDIT(WeightTrainingStat):
                 rope_emb_L_1_1_D=rope_emb_L_1_1_D,
                 adaln_lora_B_T_3D=adaln_lora_B_T_3D,
                 extra_per_block_pos_emb=extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D,
+                timesteps_B_T=timesteps_B_T,
+                crossattn_logit_boost=crossattn_logit_boost,
+                solver_step_index=solver_step_index,
+                crossattn_logit_boost_spatial_weight=crossattn_logit_boost_spatial_weight,
             )
             if intermediate_feature_ids and i in intermediate_feature_ids:
                 x_reshaped_for_disc = rearrange(x_B_T_H_W_D, "b tp hp wp d -> b (tp hp wp) d")

@@ -29,7 +29,7 @@ from cosmos_transfer2._src.imaginaire.lazy_config import LazyCall as L
 from cosmos_transfer2._src.imaginaire.lazy_config import LazyDict
 from cosmos_transfer2._src.imaginaire.utils import log
 from cosmos_transfer2._src.imaginaire.utils.context_parallel import broadcast_split_tensor, find_split
-from cosmos_transfer2._src.predict2.conditioner import BooleanFlag, GeneralConditioner, ReMapkey, TextAttr
+from cosmos_transfer2._src.predict2.conditioner import BooleanFlag, CrossAttnLogitBoostParams, GeneralConditioner, ReMapkey, TextAttr
 from cosmos_transfer2._src.predict2.configs.video2world.defaults.conditioner import (
     Video2WorldCondition,
     Video2WorldConditionV2,
@@ -152,6 +152,14 @@ class ControlVideo2WorldConditioner(GeneralConditioner):
         override_dropout_rate: Optional[Dict[str, float]] = None,
     ) -> ControlVideo2WorldCondition:
         output = self._forward(batch, override_dropout_rate)
+        boost = batch.get("crossattn_logit_boost")
+        if boost is not None:
+            if isinstance(boost, dict):
+                boost = CrossAttnLogitBoostParams(**boost)
+            output["crossattn_logit_boost"] = boost
+        sw = batch.get("crossattn_logit_boost_spatial_weight")
+        if sw is not None:
+            output["crossattn_logit_boost_spatial_weight"] = sw
         return ControlVideo2WorldCondition(**output)
 
     def _forward(
@@ -229,6 +237,14 @@ class ControlVideo2WorldConditionerImageContext(ControlVideo2WorldConditioner):
         override_dropout_rate: Optional[Dict[str, float]] = None,
     ) -> ControlVideo2WorldConditionImageContext:
         output = super()._forward(batch, override_dropout_rate)
+        boost = batch.get("crossattn_logit_boost")
+        if boost is not None:
+            if isinstance(boost, dict):
+                boost = CrossAttnLogitBoostParams(**boost)
+            output["crossattn_logit_boost"] = boost
+        sw = batch.get("crossattn_logit_boost_spatial_weight")
+        if sw is not None:
+            output["crossattn_logit_boost_spatial_weight"] = sw
         return ControlVideo2WorldConditionImageContext(**output)
 
     def get_condition_with_negative_prompt(
